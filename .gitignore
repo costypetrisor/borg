@@ -15,15 +15,14 @@ platform_windows.c
 platform_posix.c
 *.egg-info
 *.pyc
-*.pyo
 *.so
 .idea/
 .cache/
-src/borg/_version.py
 borg.build/
 borg.dist/
 borg.exe
 *.dll
 .coverage
+.coverage.*
 .vagrant
 .eggs

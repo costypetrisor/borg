@@ -1,3 +1,6 @@
+sentinel = object()
+
+
 class LRUCache:
     def __init__(self, capacity, dispose):
         self._cache = {}
@@ -27,6 +30,20 @@ class LRUCache:
 
     def __contains__(self, key):
         return key in self._cache
+
+    def get(self, key, default=None):
+        value = self._cache.get(key, sentinel)
+        if value is sentinel:
+            return default
+        self._lru.remove(key)
+        self._lru.append(key)
+        return value
+
+    def upd(self, key, value):
+        # special use only: update the value for an existing key without having to dispose it first
+        # this method complements __setitem__ which should be used for the normal use case.
+        assert key in self._cache, "Unexpected attempt to update a non-existing item."
+        self._cache[key] = value
 
     def clear(self):
         for value in self._cache.values():

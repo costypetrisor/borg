@@ -1,51 +1,77 @@
 # -*- encoding: utf-8 *-*
 import os
+import io
 import re
 import sys
-import subprocess
+from collections import OrderedDict
+from datetime import datetime
 from glob import glob
 
-from distutils.command.build import build
-from distutils.core import Command
+try:
+    import multiprocessing
+except ImportError:
+    multiprocessing = None
 
-import textwrap
+from distutils.command.clean import clean
+from setuptools.command.build_ext import build_ext
+from setuptools import setup, find_packages, Extension
+from setuptools.command.sdist import sdist
 
-min_python = (3, 4)
-my_python = sys.version_info
+try:
+    from Cython.Build import cythonize
+except ImportError:
+    cythonize = None
 
-if my_python < min_python:
-    print("Borg requires Python %d.%d or later" % min_python)
-    sys.exit(1)
+import setup_lz4
+import setup_zstd
+import setup_b2
+import setup_docs
+
+# True: use the shared liblz4 (>= 1.7.0 / r129) from the system, False: use the bundled lz4 code
+prefer_system_liblz4 = True
+
+# True: use the shared libzstd (>= 1.3.0) from the system, False: use the bundled zstd code
+prefer_system_libzstd = True
+
+# True: use the shared libb2 from the system, False: use the bundled blake2 code
+prefer_system_libb2 = True
+
+cpu_threads = multiprocessing.cpu_count() if multiprocessing else 1
 
 # Are we building on ReadTheDocs?
 on_rtd = os.environ.get('READTHEDOCS')
 
-# msgpack pure python data corruption was fixed in 0.4.6.
-# Also, we might use some rather recent API features.
-install_requires = ['msgpack-python>=0.4.6', ]
+install_requires = [
+    # we are rather picky about msgpack versions, because a good working msgpack is
+    # very important for borg, see https://github.com/borgbackup/borg/issues/3753
+    # as of now, 0.5.6 is the only preferred version of msgpack:
+    'msgpack==0.5.6',
+    # if you can't satisfy the above requirement, these are versions that might
+    # also work ok, IF you make sure to use the COMPILED version of msgpack-python,
+    # NOT the PURE PYTHON fallback implementation: ==0.5.1, ==0.5.4
+    # using any other version is not supported by borg development, feel free to
+    # do it on your own risk (and after own testing).
+]
 
+# note for package maintainers: if you package borgbackup for distribution,
+# please add llfuse as a *requirement* on all platforms that have a working
+# llfuse package. "borg mount" needs llfuse to work.
+# if you do not have llfuse, do not require it, most of borgbackup will work.
 extras_require = {
-    # llfuse 0.40 (tested, proven, ok), needs FUSE version >= 2.8.0
-    # llfuse 0.41 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 0.41.1 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 0.42 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 1.0 (tested shortly, looks ok), needs FUSE version >= 2.8.0
-    # llfuse 2.0 will break API
-    'fuse': ['llfuse<2.0', ],
+    # llfuse 1.x should work, llfuse 2.0 will break API
+    'fuse': [
+        'llfuse >=1.1, <2.0',
+        'llfuse >=1.3.4; python_version >="3.7"',
+    ],
 }
 
-if sys.platform.startswith('freebsd'):
-    # llfuse was frequently broken / did not build on freebsd
-    # llfuse 0.41.1, 1.1 are ok
-    extras_require['fuse'] = ['llfuse <2.0, !=0.42.*, !=0.43, !=1.0', ]
-
-from setuptools import setup, find_packages, Extension
-from setuptools.command.sdist import sdist
-
 compress_source = 'src/borg/compress.pyx'
-crypto_source = 'src/borg/crypto.pyx'
+crypto_ll_source = 'src/borg/crypto/low_level.pyx'
+crypto_helpers = 'src/borg/crypto/_crypto_helpers.c'
 chunker_source = 'src/borg/chunker.pyx'
 hashindex_source = 'src/borg/hashindex.pyx'
+item_source = 'src/borg/item.pyx'
+checksums_source = 'src/borg/algorithms/checksums.pyx'
 platform_posix_source = 'src/borg/platform/posix.pyx'
 platform_linux_source = 'src/borg/platform/linux.pyx'
 platform_darwin_source = 'src/borg/platform/darwin.pyx'
@@ -54,9 +80,11 @@ platform_windows_source = 'src/borg/platform/windows.pyx'
 
 cython_sources = [
     compress_source,
-    crypto_source,
+    crypto_ll_source,
     chunker_source,
     hashindex_source,
+    item_source,
+    checksums_source,
 
     platform_posix_source,
     platform_linux_source,
@@ -65,49 +93,16 @@ cython_sources = [
     platform_windows_source,
 ]
 
-try:
-    from Cython.Distutils import build_ext
-    import Cython.Compiler.Main as cython_compiler
-
-    class Sdist(sdist):
-        def __init__(self, *args, **kwargs):
-            for src in cython_sources:
-                cython_compiler.compile(src, cython_compiler.default_options)
-            super().__init__(*args, **kwargs)
-
-        def make_distribution(self):
-            self.filelist.extend([
-                'src/borg/compress.c',
-                'src/borg/crypto.c',
-                'src/borg/chunker.c', 'src/borg/_chunker.c',
-                'src/borg/hashindex.c', 'src/borg/_hashindex.c',
-
-                'src/borg/platform/posix.c',
-                'src/borg/platform/linux.c',
-                'src/borg/platform/freebsd.c',
-                'src/borg/platform/darwin.c',
-                'src/borg/platform/windows.c',
-            ])
-            super().make_distribution()
-
-except ImportError:
+if cythonize:
+    Sdist = sdist
+else:
     class Sdist(sdist):
         def __init__(self, *args, **kwargs):
             raise Exception('Cython is required to run sdist')
 
-    compress_source = compress_source.replace('.pyx', '.c')
-    crypto_source = crypto_source.replace('.pyx', '.c')
-    chunker_source = chunker_source.replace('.pyx', '.c')
-    hashindex_source = hashindex_source.replace('.pyx', '.c')
-    platform_posix_source = platform_posix_source.replace('.pyx', '.c')
-    platform_linux_source = platform_linux_source.replace('.pyx', '.c')
-    platform_freebsd_source = platform_freebsd_source.replace('.pyx', '.c')
-    platform_darwin_source = platform_darwin_source.replace('.pyx', '.c')
-    platform_windows_source = platform_windows_source.replace('.pyx', '.c')
-    from distutils.command.build_ext import build_ext
     if not on_rtd and not all(os.path.exists(path) for path in [
-        compress_source, crypto_source, chunker_source, hashindex_source,
-        platform_linux_source, platform_freebsd_source, platform_darwin_source, platform_windows_source]):
+        compress_source, crypto_ll_source, chunker_source, hashindex_source, item_source, checksums_source,
+        platform_posix_source, platform_linux_source, platform_freebsd_source, platform_darwin_source, platform_windows_source]):
         raise ImportError('The GIT version of Borg needs Cython. Install Cython or use a released version.')
 
 
@@ -115,22 +110,14 @@ def detect_openssl(prefixes):
     for prefix in prefixes:
         filename = os.path.join(prefix, 'include', 'openssl', 'evp.h')
         if os.path.exists(filename):
-            with open(filename, 'r') as fd:
-                if 'PKCS5_PBKDF2_HMAC(' in fd.read():
-                    return prefix
-
-
-def detect_lz4(prefixes):
-    for prefix in prefixes:
-        filename = os.path.join(prefix, 'include', 'lz4.h')
-        if os.path.exists(filename):
-            with open(filename, 'r') as fd:
-                if 'LZ4_decompress_safe' in fd.read():
+            with open(filename, 'rb') as fd:
+                if b'PKCS5_PBKDF2_HMAC(' in fd.read():
                     return prefix
 
 
 include_dirs = []
 library_dirs = []
+define_macros = []
 
 windowsIncludeDirs = []
 if sys.platform == 'win32':
@@ -164,200 +151,135 @@ else:
     possible_lz4_prefixes = ['/usr', '/usr/local', '/usr/local/opt/lz4', '/usr/local/lz4',
                              '/usr/local/borg', '/opt/local', '/opt/pkg', ]
 
-if os.environ.get('BORG_LZ4_PREFIX'):
-    possible_lz4_prefixes.insert(0, os.environ.get('BORG_LZ4_PREFIX'))
-lz4_prefix = detect_lz4(possible_lz4_prefixes)
-if lz4_prefix:
-    include_dirs.append(os.path.join(lz4_prefix, 'include'))
-    library_dirs.append(os.path.join(lz4_prefix, 'lib'))
-elif not on_rtd:
-    raise Exception('Unable to find LZ4 headers. (Looked here: {})'.format(', '.join(possible_lz4_prefixes)))
+
+possible_liblz4_prefixes = ['/usr', '/usr/local', '/usr/local/opt/lz4', '/usr/local/lz4',
+                         '/usr/local/borg', '/opt/local', '/opt/pkg', ]
+if os.environ.get('BORG_LIBLZ4_PREFIX'):
+    possible_liblz4_prefixes.insert(0, os.environ.get('BORG_LIBLZ4_PREFIX'))
+liblz4_prefix = setup_lz4.lz4_system_prefix(possible_liblz4_prefixes)
+if prefer_system_liblz4 and liblz4_prefix:
+    print('Detected and preferring liblz4 over bundled LZ4')
+    define_macros.append(('BORG_USE_LIBLZ4', 'YES'))
+    liblz4_system = True
+else:
+    liblz4_system = False
+
+possible_libb2_prefixes = ['/usr', '/usr/local', '/usr/local/opt/libb2', '/usr/local/libb2',
+                           '/usr/local/borg', '/opt/local', '/opt/pkg', ]
+if os.environ.get('BORG_LIBB2_PREFIX'):
+    possible_libb2_prefixes.insert(0, os.environ.get('BORG_LIBB2_PREFIX'))
+libb2_prefix = setup_b2.b2_system_prefix(possible_libb2_prefixes)
+if prefer_system_libb2 and libb2_prefix:
+    print('Detected and preferring libb2 over bundled BLAKE2')
+    define_macros.append(('BORG_USE_LIBB2', 'YES'))
+    libb2_system = True
+else:
+    libb2_system = False
+
+possible_libzstd_prefixes = ['/usr', '/usr/local', '/usr/local/opt/libzstd', '/usr/local/libzstd',
+                             '/usr/local/borg', '/opt/local', '/opt/pkg', ]
+if os.environ.get('BORG_LIBZSTD_PREFIX'):
+    possible_libzstd_prefixes.insert(0, os.environ.get('BORG_LIBZSTD_PREFIX'))
+libzstd_prefix = setup_zstd.zstd_system_prefix(possible_libzstd_prefixes)
+if prefer_system_libzstd and libzstd_prefix:
+    print('Detected and preferring libzstd over bundled ZSTD')
+    define_macros.append(('BORG_USE_LIBZSTD', 'YES'))
+    libzstd_system = True
+else:
+    libzstd_system = False
 
 
 with open('README.rst', 'r') as fd:
     long_description = fd.read()
+    # remove header, but have one \n before first headline
+    start = long_description.find('What is BorgBackup?')
+    assert start >= 0
+    long_description = '\n' + long_description[start:]
+    # remove badges
+    long_description = re.compile(r'^\.\. start-badges.*^\.\. end-badges', re.M | re.S).sub('', long_description)
+    # remove unknown directives
+    long_description = re.compile(r'^\.\. highlight:: \w+$', re.M).sub('', long_description)
 
 
-class build_usage(Command):
-    description = "generate usage for each command"
-
-    user_options = [
-        ('output=', 'O', 'output directory'),
-    ]
-
-    def initialize_options(self):
+def rm(file):
+    try:
+        os.unlink(file)
+        print('rm', file)
+    except FileNotFoundError:
         pass
 
-    def finalize_options(self):
-        pass
 
+class Clean(clean):
     def run(self):
-        print('generating usage docs')
-        # allows us to build docs without the C modules fully loaded during help generation
-        from borg.archiver import Archiver
-        parser = Archiver(prog='borg').parser
-        choices = {}
-        for action in parser._actions:
-            if action.choices is not None:
-                choices.update(action.choices)
-        print('found commands: %s' % list(choices.keys()))
-        if not os.path.exists('docs/usage'):
-            os.mkdir('docs/usage')
-        for command, parser in choices.items():
-            print('generating help for %s' % command)
-            with open('docs/usage/%s.rst.inc' % command, 'w') as doc:
-                doc.write(".. IMPORTANT: this file is auto-generated from borg's built-in help, do not edit!\n\n")
-                if command == 'help':
-                    for topic in Archiver.helptext:
-                        params = {"topic": topic,
-                                  "underline": '~' * len('borg help ' + topic)}
-                        doc.write(".. _borg_{topic}:\n\n".format(**params))
-                        doc.write("borg help {topic}\n{underline}\n\n".format(**params))
-                        doc.write(Archiver.helptext[topic])
-                else:
-                    params = {"command": command,
-                              "underline": '-' * len('borg ' + command)}
-                    doc.write(".. _borg_{command}:\n\n".format(**params))
-                    doc.write("borg {command}\n{underline}\n::\n\n    borg {command}".format(**params))
-                    self.write_usage(parser, doc)
-                    epilog = parser.epilog
-                    parser.epilog = None
-                    self.write_options(parser, doc)
-                    doc.write("\n\nDescription\n~~~~~~~~~~~\n")
-                    doc.write(epilog)
-        common_options = [group for group in choices['create']._action_groups if group.title == 'Common options'][0]
-        with open('docs/usage/common-options.rst.inc', 'w') as doc:
-            self.write_options_group(common_options, doc, False)
-
-    def write_usage(self, parser, fp):
-        if any(len(o.option_strings) for o in parser._actions):
-            fp.write(' <options>')
-        for option in parser._actions:
-            if option.option_strings:
-                continue
-            fp.write(' ' + option.metavar)
-
-    def write_options(self, parser, fp):
-        for group in parser._action_groups:
-            if group.title == 'Common options':
-                fp.write('\n\n`Common options`_\n')
-                fp.write('    |')
-            else:
-                self.write_options_group(group, fp)
-
-    def write_options_group(self, group, fp, with_title=True):
-        def is_positional_group(group):
-            return any(not o.option_strings for o in group._group_actions)
-
-        def get_help(option):
-            text = textwrap.dedent((option.help or '') % option.__dict__)
-            return '\n'.join('| ' + line for line in text.splitlines())
-
-        def shipout(text):
-            fp.write(textwrap.indent('\n'.join(text), ' ' * 4))
-
-        if not group._group_actions:
-            return
-
-        if with_title:
-            fp.write('\n\n')
-            fp.write(group.title + '\n')
-        text = []
-
-        if is_positional_group(group):
-            for option in group._group_actions:
-                text.append(option.metavar)
-                text.append(textwrap.indent(option.help or '', ' ' * 4))
-            shipout(text)
-            return
-
-        options = []
-        for option in group._group_actions:
-            if option.metavar:
-                option_fmt = '``%%s %s``' % option.metavar
-            else:
-                option_fmt = '``%s``'
-            option_str = ', '.join(option_fmt % s for s in option.option_strings)
-            options.append((option_str, option))
-        for option_str, option in options:
-            help = textwrap.indent(get_help(option), ' ' * 4)
-            text.append(option_str)
-            text.append(help)
-        shipout(text)
-
-
-class build_api(Command):
-    description = "generate a basic api.rst file based on the modules available"
-
-    user_options = [
-        ('output=', 'O', 'output directory'),
-    ]
-
-    def initialize_options(self):
-        pass
-
-    def finalize_options(self):
-        pass
-
-    def run(self):
-        print("auto-generating API documentation")
-        with open("docs/api.rst", "w") as doc:
-            doc.write("""
-API Documentation
-=================
-""")
-            for mod in glob('src/borg/*.py') + glob('src/borg/*.pyx'):
-                print("examining module %s" % mod)
-                mod = mod.replace('.pyx', '').replace('.py', '').replace('/', '.')
-                if "._" not in mod:
-                    doc.write("""
-.. automodule:: %s
-    :members:
-    :undoc-members:
-""" % mod)
+        super().run()
+        for source in cython_sources:
+            genc = source.replace('.pyx', '.c')
+            rm(genc)
+            compiled_glob = source.replace('.pyx', '.cpython*')
+            for compiled in sorted(glob(compiled_glob)):
+                rm(compiled)
 
 
 cmdclass = {
     'build_ext': build_ext,
-    'build_api': build_api,
-    'build_usage': build_usage,
-    'sdist': Sdist
+    'build_usage': setup_docs.build_usage,
+    'build_man': setup_docs.build_man,
+    'sdist': Sdist,
+    'clean': Clean,
 }
 
 ext_modules = []
 if not on_rtd:
+    compress_ext_kwargs = dict(sources=[compress_source], include_dirs=include_dirs, library_dirs=library_dirs,
+                               define_macros=define_macros)
+    compress_ext_kwargs = setup_lz4.lz4_ext_kwargs(bundled_path='src/borg/algorithms/lz4',
+                                                   system_prefix=liblz4_prefix, system=liblz4_system,
+                                                   **compress_ext_kwargs)
+    compress_ext_kwargs = setup_zstd.zstd_ext_kwargs(bundled_path='src/borg/algorithms/zstd',
+                                                     system_prefix=libzstd_prefix, system=libzstd_system,
+                                                     multithreaded=False, legacy=False, **compress_ext_kwargs)
+    crypto_ext_kwargs = dict(sources=[crypto_ll_source, crypto_helpers], libraries=['crypto'],
+                             include_dirs=include_dirs, library_dirs=library_dirs, define_macros=define_macros)
+    crypto_ext_kwargs = setup_b2.b2_ext_kwargs(bundled_path='src/borg/algorithms/blake2',
+                                               system_prefix=libb2_prefix, system=libb2_system,
+                                               **crypto_ext_kwargs)
     ext_modules += [
-    Extension('borg.compress', [compress_source], libraries=['lz4'], include_dirs=include_dirs, library_dirs=library_dirs),
-    Extension('borg.crypto', [crypto_source], libraries=['crypto'], include_dirs=include_dirs, library_dirs=library_dirs),
-    Extension('borg.chunker', [chunker_source]),
-    Extension('borg.hashindex', [hashindex_source])
-]
-    if sys.platform.startswith(('linux', 'freebsd', 'darwin')):
-        ext_modules.append(Extension('borg.platform.posix', [platform_posix_source]))
+        Extension('borg.compress', **compress_ext_kwargs),
+        Extension('borg.crypto.low_level', **crypto_ext_kwargs),
+        Extension('borg.hashindex', [hashindex_source]),
+        Extension('borg.item', [item_source]),
+        Extension('borg.chunker', [chunker_source]),
+        Extension('borg.algorithms.checksums', [checksums_source]),
+    ]
 
+    posix_ext = Extension('borg.platform.posix', [platform_posix_source])
+    linux_ext = Extension('borg.platform.linux', [platform_linux_source], libraries=['acl'])
+    freebsd_ext = Extension('borg.platform.freebsd', [platform_freebsd_source])
+    darwin_ext = Extension('borg.platform.darwin', [platform_darwin_source])
+
+    if not sys.platform.startswith(('win32', )):
+        ext_modules.append(posix_ext)
     if sys.platform == 'linux':
-        ext_modules.append(Extension('borg.platform.linux', [platform_linux_source], libraries=['acl']))
+        ext_modules.append(linux_ext)
     elif sys.platform.startswith('freebsd'):
-        ext_modules.append(Extension('borg.platform.freebsd', [platform_freebsd_source]))
+        ext_modules.append(freebsd_ext)
     elif sys.platform == 'darwin':
-        ext_modules.append(Extension('borg.platform.darwin', [platform_darwin_source]))
-    elif sys.platform == 'win32':
-        ext_modules.append(Extension('borg.platform.windows', [platform_windows_source], define_macros=[('UNICODE', None), ('_UNICODE', None)]))
+        ext_modules.append(darwin_ext)
 
+    # sometimes there's no need to cythonize
+    # this breaks chained commands like 'clean sdist'
+    cythonizing = len(sys.argv) > 1 and sys.argv[1] not in ('clean', 'egg_info', '--help-commands', '--version') \
+                  and '--help' not in sys.argv[1:]
 
-def parse(root, describe_command=None):
-    file = open('src/borg/_version.py', 'w')
-    output = subprocess.check_output("git describe --tags --long").decode().strip()
-    file.write('version = "' + output + '"\n')
-    return output
-
-parse_function = parse if sys.platform == 'win32' else None
+    if cythonize and cythonizing:
+        # compile .pyx extensions to .c in parallel
+        cythonize([posix_ext, linux_ext, freebsd_ext, darwin_ext], nthreads=cpu_threads+1)
+        ext_modules = cythonize(ext_modules, nthreads=cpu_threads+1)
 
 setup(
     name='borgbackup',
     use_scm_version={
         'write_to': 'src/borg/_version.py',
-        'parse': parse_function,
     },
     author='The Borg Collective (see AUTHORS file)',
     author_email='borgbackup@python.org',
@@ -367,7 +289,7 @@ setup(
     license='BSD',
     platforms=['Linux', 'MacOS X', 'FreeBSD', 'OpenBSD', 'NetBSD', ],
     classifiers=[
-        'Development Status :: 4 - Beta',
+        'Development Status :: 2 - Pre-Alpha',
         'Environment :: Console',
         'Intended Audience :: System Administrators',
         'License :: OSI Approved :: BSD License',
@@ -378,14 +300,13 @@ setup(
         'Operating System :: POSIX :: Linux',
         'Programming Language :: Python',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.4',
-        'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
         'Topic :: Security :: Cryptography',
         'Topic :: System :: Archiving :: Backup',
     ],
     packages=find_packages('src'),
     package_dir={'': 'src'},
-    include_package_data=True,
     zip_safe=False,
     entry_points={
         'console_scripts': [
@@ -393,9 +314,17 @@ setup(
             'borgfs = borg.archiver:main',
         ]
     },
+    # See also the MANIFEST.in file.
+    # We want to install all the files in the package directories...
+    include_package_data=True,
+    # ...except the source files which have been compiled (C extensions):
+    exclude_package_data={
+        '': ['*.c', '*.h', '*.pyx', ],
+    },
     cmdclass=cmdclass,
     ext_modules=ext_modules,
     setup_requires=['setuptools_scm>=1.7'],
     install_requires=install_requires,
     extras_require=extras_require,
+    python_requires='>=3.6',
 )

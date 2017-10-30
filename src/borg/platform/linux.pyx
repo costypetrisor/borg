@@ -1,18 +1,32 @@
 import os
 import re
-import resource
 import stat
+import subprocess
 
 from ..helpers import posix_acl_use_stored_uid_gid
 from ..helpers import user2uid, group2gid
 from ..helpers import safe_decode, safe_encode
 from .base import SyncFile as BaseSyncFile
-from .posix import swidth
+from .base import safe_fadvise
+from .xattr import _listxattr_inner, _getxattr_inner, _setxattr_inner, split_string0
 
 from libc cimport errno
 from libc.stdint cimport int64_t
 
-API_VERSION = 3
+API_VERSION = '1.2_02'
+
+cdef extern from "sys/xattr.h":
+    ssize_t c_listxattr "listxattr" (const char *path, char *list, size_t size)
+    ssize_t c_llistxattr "llistxattr" (const char *path, char *list, size_t size)
+    ssize_t c_flistxattr "flistxattr" (int filedes, char *list, size_t size)
+
+    ssize_t c_getxattr "getxattr" (const char *path, const char *name, void *value, size_t size)
+    ssize_t c_lgetxattr "lgetxattr" (const char *path, const char *name, void *value, size_t size)
+    ssize_t c_fgetxattr "fgetxattr" (int filedes, const char *name, void *value, size_t size)
+
+    int c_setxattr "setxattr" (const char *path, const char *name, const void *value, size_t size, int flags)
+    int c_lsetxattr "lsetxattr" (const char *path, const char *name, const void *value, size_t size, int flags)
+    int c_fsetxattr "fsetxattr" (int filedes, const char *name, const void *value, size_t size, int flags)
 
 cdef extern from "sys/types.h":
     int ACL_TYPE_ACCESS
@@ -25,12 +39,15 @@ cdef extern from "sys/acl.h":
 
     int acl_free(void *obj)
     acl_t acl_get_file(const char *path, int type)
-    acl_t acl_set_file(const char *path, int type, acl_t acl)
+    acl_t acl_get_fd(int fd)
+    int acl_set_file(const char *path, int type, acl_t acl)
+    int acl_set_fd(int fd, acl_t acl)
     acl_t acl_from_text(const char *buf)
     char *acl_to_text(acl_t acl, ssize_t *len)
 
 cdef extern from "acl/libacl.h":
     int acl_extended_file(const char *path)
+    int acl_extended_fd(int fd)
 
 cdef extern from "fcntl.h":
     int sync_file_range(int fd, int64_t offset, int64_t nbytes, unsigned int flags)
@@ -52,10 +69,57 @@ cdef extern from "linux/fs.h":
 cdef extern from "sys/ioctl.h":
     int ioctl(int fildes, int request, ...)
 
+cdef extern from "unistd.h":
+    int _SC_PAGESIZE
+    long sysconf(int name)
+
 cdef extern from "string.h":
     char *strerror(int errnum)
 
 _comment_re = re.compile(' *#.*', re.M)
+
+
+def listxattr(path, *, follow_symlinks=False):
+    def func(path, buf, size):
+        if isinstance(path, int):
+            return c_flistxattr(path, <char *> buf, size)
+        else:
+            if follow_symlinks:
+                return c_listxattr(path, <char *> buf, size)
+            else:
+                return c_llistxattr(path, <char *> buf, size)
+
+    n, buf = _listxattr_inner(func, path)
+    return [name for name in split_string0(buf[:n])
+            if name and not name.startswith(b'system.posix_acl_')]
+
+
+def getxattr(path, name, *, follow_symlinks=False):
+    def func(path, name, buf, size):
+        if isinstance(path, int):
+            return c_fgetxattr(path, name, <char *> buf, size)
+        else:
+            if follow_symlinks:
+                return c_getxattr(path, name, <char *> buf, size)
+            else:
+                return c_lgetxattr(path, name, <char *> buf, size)
+
+    n, buf = _getxattr_inner(func, path, name)
+    return bytes(buf[:n])
+
+
+def setxattr(path, name, value, *, follow_symlinks=False):
+    def func(path, name, value, size):
+        flags = 0
+        if isinstance(path, int):
+            return c_fsetxattr(path, name, <char *> value, size, flags)
+        else:
+            if follow_symlinks:
+                return c_setxattr(path, name, <char *> value, size, flags)
+            else:
+                return c_lsetxattr(path, name, <char *> value, size, flags)
+
+    _setxattr_inner(func, path, name, value)
 
 
 BSD_TO_LINUX_FLAGS = {
@@ -67,8 +131,11 @@ BSD_TO_LINUX_FLAGS = {
 
 
 def set_flags(path, bsd_flags, fd=None):
-    if fd is None and stat.S_ISLNK(os.lstat(path).st_mode):
-        return
+    if fd is None:
+        st = os.stat(path, follow_symlinks=False)
+        if stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            # see comment in get_flags()
+            return
     cdef int flags = 0
     for bsd_flag, linux_flag in BSD_TO_LINUX_FLAGS.items():
         if bsd_flags & bsd_flag:
@@ -86,17 +153,24 @@ def set_flags(path, bsd_flags, fd=None):
             os.close(fd)
 
 
-def get_flags(path, st):
-    cdef int linux_flags
-    try:
-        fd = os.open(path, os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW)
-    except OSError:
+def get_flags(path, st, fd=None):
+    if stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        # avoid opening devices files - trying to open non-present devices can be rather slow.
+        # avoid opening symlinks, O_NOFOLLOW would make the open() fail anyway.
         return 0
+    cdef int linux_flags
+    open_fd = fd is None
+    if open_fd:
+        try:
+            fd = os.open(path, os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW)
+        except OSError:
+            return 0
     try:
         if ioctl(fd, FS_IOC_GETFLAGS, &linux_flags) == -1:
             return 0
     finally:
-        os.close(fd)
+        if open_fd:
+            os.close(fd)
     bsd_flags = 0
     for bsd_flag, linux_flag in BSD_TO_LINUX_FLAGS.items():
         if linux_flags & linux_flag:
@@ -153,26 +227,37 @@ cdef acl_numeric_ids(acl):
     return safe_encode('\n'.join(entries))
 
 
-def acl_get(path, item, st, numeric_owner=False):
+def acl_get(path, item, st, numeric_owner=False, fd=None):
     cdef acl_t default_acl = NULL
     cdef acl_t access_acl = NULL
     cdef char *default_text = NULL
     cdef char *access_text = NULL
 
-    p = <bytes>os.fsencode(path)
-    if stat.S_ISLNK(st.st_mode) or acl_extended_file(p) <= 0:
+    if fd is None and isinstance(path, str):
+        path = os.fsencode(path)
+    if stat.S_ISLNK(st.st_mode):
+        return
+    if (fd is not None and acl_extended_fd(fd) <= 0
+        or
+        fd is None and acl_extended_file(path) <= 0):
         return
     if numeric_owner:
         converter = acl_numeric_ids
     else:
         converter = acl_append_numeric_ids
     try:
-        access_acl = acl_get_file(p, ACL_TYPE_ACCESS)
+        if fd is not None:
+            # we only have a fd for FILES (not other fs objects), so we can get the access_acl:
+            assert stat.S_ISREG(st.st_mode)
+            access_acl = acl_get_fd(fd)
+        else:
+            # if we have no fd, it can be anything
+            access_acl = acl_get_file(path, ACL_TYPE_ACCESS)
+            default_acl = acl_get_file(path, ACL_TYPE_DEFAULT)
         if access_acl:
             access_text = acl_to_text(access_acl, NULL)
             if access_text:
                 item['acl_access'] = converter(access_text)
-        default_acl = acl_get_file(p, ACL_TYPE_DEFAULT)
         if default_acl:
             default_text = acl_to_text(default_acl, NULL)
             if default_text:
@@ -184,40 +269,49 @@ def acl_get(path, item, st, numeric_owner=False):
         acl_free(access_acl)
 
 
-def acl_set(path, item, numeric_owner=False):
+def acl_set(path, item, numeric_owner=False, fd=None):
     cdef acl_t access_acl = NULL
     cdef acl_t default_acl = NULL
 
-    p = <bytes>os.fsencode(path)
+    if fd is None and isinstance(path, str):
+        path = os.fsencode(path)
     if numeric_owner:
         converter = posix_acl_use_stored_uid_gid
     else:
         converter = acl_use_local_uid_gid
     access_text = item.get('acl_access')
-    default_text = item.get('acl_default')
     if access_text:
         try:
             access_acl = acl_from_text(<bytes>converter(access_text))
             if access_acl:
-                acl_set_file(p, ACL_TYPE_ACCESS, access_acl)
+                if fd is not None:
+                    acl_set_fd(fd, access_acl)
+                else:
+                    acl_set_file(path, ACL_TYPE_ACCESS, access_acl)
         finally:
             acl_free(access_acl)
+    default_text = item.get('acl_default')
     if default_text:
         try:
             default_acl = acl_from_text(<bytes>converter(default_text))
             if default_acl:
-                acl_set_file(p, ACL_TYPE_DEFAULT, default_acl)
+                # default acls apply only to directories
+                if False and fd is not None:  # Linux API seems to not support this
+                    acl_set_fd(fd, default_acl)
+                else:
+                    acl_set_file(path, ACL_TYPE_DEFAULT, default_acl)
         finally:
             acl_free(default_acl)
+
 
 cdef _sync_file_range(fd, offset, length, flags):
     assert offset & PAGE_MASK == 0, "offset %d not page-aligned" % offset
     assert length & PAGE_MASK == 0, "length %d not page-aligned" % length
     if sync_file_range(fd, offset, length, flags) != 0:
         raise OSError(errno.errno, os.strerror(errno.errno))
-    os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+    safe_fadvise(fd, offset, length, 'DONTNEED')
 
-cdef unsigned PAGE_MASK = resource.getpagesize() - 1
+cdef unsigned PAGE_MASK = sysconf(_SC_PAGESIZE) - 1
 
 
 class SyncFile(BaseSyncFile):
@@ -228,8 +322,8 @@ class SyncFile(BaseSyncFile):
     disk in the immediate future.
     """
 
-    def __init__(self, path):
-        super().__init__(path)
+    def __init__(self, path, binary=False):
+        super().__init__(path, binary)
         self.offset = 0
         self.write_window = (16 * 1024 ** 2) & ~PAGE_MASK
         self.last_sync = 0
@@ -250,4 +344,6 @@ class SyncFile(BaseSyncFile):
     def sync(self):
         self.fd.flush()
         os.fdatasync(self.fileno)
-        os.posix_fadvise(self.fileno, 0, 0, os.POSIX_FADV_DONTNEED)
+        # tell the OS that it does not need to cache what we just wrote,
+        # avoids spoiling the cache for the OS and other processes.
+        safe_fadvise(self.fileno, 0, 0, 'DONTNEED')
