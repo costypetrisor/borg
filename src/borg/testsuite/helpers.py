@@ -29,9 +29,6 @@ from ..helpers import dash_open
 
 from . import BaseTestCase, FakeInputs
 
-if sys.platform == 'win32':
-    import posixpath
-
 
 class BigIntTestCase(BaseTestCase):
 
@@ -101,9 +98,9 @@ class TestLocationWithoutEnv:
 
         if sys.platform == 'win32':
             assert repr(Location('file://C:/some/path::archive')).replace('\\\\', '/') == \
-                "Location(proto='file', user=None, host=None, port=None, path='/some/path', archive='archive')"
+                "Location(proto='file', user=None, host=None, port=None, path='C:/some/path', archive='archive')"
             assert repr(Location('file://C:/some/path')).replace('\\\\', '/') == \
-                "Location(proto='file', user=None, host=None, port=None, path='/some/path', archive=None)"
+                "Location(proto='file', user=None, host=None, port=None, path='C:/some/path', archive=None)"
             assert Location('file://C:/some/path').to_key_filename().replace('\\\\', '/') == keys_dir + 'some_path'
         else:
             assert repr(Location('file:///some/path::archive')) == \
@@ -227,9 +224,9 @@ class TestLocationWithoutEnv:
         test_pid = os.getpid()
         assert repr(Location('/some/path::archive{pid}')) == \
             "Location(proto='file', user=None, host=None, port=None, path='/some/path', archive='archive{}')".format(test_pid)
-        location_time1 = Location('/some/path::archive{now}')
+        location_time1 = Location('/some/path::archive{now:%s}')
         sleep(1.1)
-        location_time2 = Location('/some/path::archive{now}')
+        location_time2 = Location('/some/path::archive{now:%s}')
         assert location_time1.archive != location_time2.archive
 
     def test_bad_syntax(self):

@@ -677,8 +677,9 @@ Utilization of max. archive size: {csize_max:.0%}
         backup_io.op = 'attrs'
         uid = gid = None
         if not self.numeric_owner:
-            uid = user2uid(item.user)
-            gid = group2gid(item.group)
+            if sys.platform != 'win32':
+                uid = user2uid(item.user)
+                gid = group2gid(item.group)
         uid = item.uid if uid is None else uid
         gid = item.gid if gid is None else gid
         # This code is a bit of a mess due to os specific differences
@@ -934,28 +935,10 @@ class MetadataCollector:
     def stat_simple_attrs(self, st):
         attrs = dict(
             mode=st.st_mode,
+            uid=st.st_uid,
+            gid=st.st_gid,
             mtime=safe_ns(st.st_mtime_ns),
         )
-        if sys.platform == 'win32':
-            user_name, user_sid = get_owner(path)
-            attrs.update({
-                'uid': 0, 'user_sid': user_sid, 'gid': st.st_gid,
-            })
-            if self.numeric_owner:
-                attrs['user'] = attrs['group'] = None
-            else:
-                attrs.update({
-                	'user': user_name, 'group': gid2group(st.st_gid),
-                })
-        else:
-            attrs.update({
-                'uid': st.st_uid, 'gid': st.st_gid,
-            })
-	        if self.numeric_owner:
-	            attrs['user'] = attrs['group'] = None
-	        else:
-	            attrs['user'] = uid2user(st.st_uid)
-	            attrs['group'] = gid2group(st.st_gid)
         # borg can work with archives only having mtime (older attic archives do not have
         # atime/ctime). it can be useful to omit atime/ctime, if they change without the
         # file content changing - e.g. to get better metadata deduplication.
@@ -963,9 +946,12 @@ class MetadataCollector:
             attrs['atime'] = safe_ns(st.st_atime_ns)
         if not self.noctime:
             attrs['ctime'] = safe_ns(st.st_ctime_ns)
-        if not self.nobirthtime and hasattr(st, 'st_birthtime'):
-            # sadly, there's no stat_result.st_birthtime_ns
-            attrs['birthtime'] = safe_ns(int(st.st_birthtime * 10**9))
+        if self.numeric_owner:
+            attrs['user'] = attrs['group'] = None
+        else:
+            if sys.platform != 'win32':
+                attrs['user'] = uid2user(st.st_uid)
+                attrs['group'] = gid2group(st.st_gid)
         return attrs
 
     def stat_ext_attrs(self, st, path, fd=None):
@@ -984,6 +970,12 @@ class MetadataCollector:
 
     def stat_attrs(self, st, path, fd=None):
         attrs = self.stat_simple_attrs(st)
+        if sys.platform == 'win32':
+            user_name, user_sid = get_owner(path)
+            attrs.update({
+                'uid': 0, 'user_sid': user_sid, 'user': user_name,
+                'gid': st.st_gid, 'group': '',
+            })
         attrs.update(self.stat_ext_attrs(st, path, fd=fd))
         return attrs
 

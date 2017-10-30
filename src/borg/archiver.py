@@ -1206,7 +1206,7 @@ class Archiver:
             format = "{path}{NL}"
         else:
             if sys.platform == 'win32':
-                format = "{user:15} {size:8} {isomtime} {path}{extra}{NL}"
+                format = "{user:8} {size:8} {mtime} {path}{extra}{NL}"
             else:
                 format = "{mode} {user:6} {group:6} {size:8} {mtime} {path}{extra}{NL}"
 

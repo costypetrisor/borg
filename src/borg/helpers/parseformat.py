@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import os.path
 import re
 import socket
@@ -181,20 +182,35 @@ def replace_placeholders(text):
     """Replace placeholders in text with their values."""
     from ..platform import fqdn, hostname
     current_time = datetime.now(timezone.utc)
-    data = {
-        'pid': os.getpid(),
-        'fqdn': fqdn,
-        'reverse-fqdn': '.'.join(reversed(fqdn.split('.'))),
-        'hostname': hostname,
-        'now': DatetimeWrapper(current_time.astimezone(None)),
-        'utcnow': DatetimeWrapper(current_time),
-        'user': uid2user(os.getuid(), os.getuid()),
-        'uuid4': str(uuid.uuid4()),
-        'borgversion': borg_version,
-        'borgmajor': '%d' % borg_version_tuple[:1],
-        'borgminor': '%d.%d' % borg_version_tuple[:2],
-        'borgpatch': '%d.%d.%d' % borg_version_tuple[:3],
-    }
+    if sys.platform == 'win32':
+        data = {
+            'pid': os.getpid(),
+            'fqdn': socket.getfqdn(),
+            'hostname': socket.gethostname(),
+            'now': DatetimeWrapper(current_time.now()),
+            'utcnow': DatetimeWrapper(current_time.utcnow()),
+            'user': os.getlogin(),
+            'uuid4': str(uuid.uuid4()),
+            'borgversion': borg_version,
+            'borgmajor': '%d' % borg_version_tuple[:1],
+            'borgminor': '%d.%d' % borg_version_tuple[:2],
+            'borgpatch': '%d.%d.%d' % borg_version_tuple[:3],
+        }
+    else:
+        data = {
+            'pid': os.getpid(),
+            'fqdn': fqdn,
+            'reverse-fqdn': '.'.join(reversed(fqdn.split('.'))),
+            'hostname': hostname,
+            'now': DatetimeWrapper(current_time.astimezone(None)),
+            'utcnow': DatetimeWrapper(current_time),
+            'user': uid2user(os.getuid(), os.getuid()),
+            'uuid4': str(uuid.uuid4()),
+            'borgversion': borg_version,
+            'borgmajor': '%d' % borg_version_tuple[:1],
+            'borgminor': '%d.%d' % borg_version_tuple[:2],
+            'borgpatch': '%d.%d.%d' % borg_version_tuple[:3],
+        }
     return format_line(text, data)
 
 
