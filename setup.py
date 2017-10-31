@@ -256,8 +256,11 @@ if not on_rtd:
     linux_ext = Extension('borg.platform.linux', [platform_linux_source], libraries=['acl'])
     freebsd_ext = Extension('borg.platform.freebsd', [platform_freebsd_source])
     darwin_ext = Extension('borg.platform.darwin', [platform_darwin_source])
+    windows_ext = Extension('borg.platform.windows', [platform_windows_source], define_macros=[('UNICODE', None), ('_UNICODE', None)])
 
-    if not sys.platform.startswith(('win32', )):
+    if sys.platform.startswith(('win32', )):
+        ext_modules.append(windows_ext)
+    else:
         ext_modules.append(posix_ext)
     if sys.platform == 'linux':
         ext_modules.append(linux_ext)
@@ -273,7 +276,7 @@ if not on_rtd:
 
     if cythonize and cythonizing:
         # compile .pyx extensions to .c in parallel
-        cythonize([posix_ext, linux_ext, freebsd_ext, darwin_ext], nthreads=cpu_threads+1)
+        cythonize([posix_ext, linux_ext, freebsd_ext, darwin_ext, windows_ext], nthreads=cpu_threads+1)
         ext_modules = cythonize(ext_modules, nthreads=cpu_threads+1)
 
 setup(
